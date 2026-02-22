@@ -5,11 +5,14 @@ from yahooquery import Ticker
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# פתרון לבעיית הנתיב בעברית ואימות SSL במחשב האישי
-os.environ['CURL_CA_BUNDLE'] = ''
+# הגדרת נתיב מסד הנתונים עבור ה-Volume ב-Railway
+DB_PATH = '/app/stocks.db'
 
 def init_db():
-    conn = sqlite3.connect('stocks.db')
+    # יצירת התיקייה במידה והיא לא קיימת (ליתר ביטחון)
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS stocks (name TEXT, ticker TEXT)''')
     c.execute("SELECT COUNT(*) FROM stocks")
@@ -24,39 +27,49 @@ def init_db():
     conn.close()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # הגדרת הכפתורים - וודא שאתה שולח /start עם סלאש רגיל
+    # יצירת מקלדת כפתורים בתחתית המסך
     keyboard = [
         ['📊 הצג את כל השערים'],
         ['➕ הוספת מניה', '❓ עזרה']
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-    await update.message.reply_text(
-        f"שלום {update.effective_user.first_name}! 👋\nהתפריט מופיע כעת למטה.",
-        reply_markup=reply_markup
+    
+    user_name = update.effective_user.first_name
+    welcome_text = (
+        f"שלום {user_name}! 👋\n"
+        "הבוט רץ על השרת המאובטח ומוכן לפעולה.\n\n"
+        "השתמש בכפתורים למטה כדי לעקוב אחרי המניות שלך."
     )
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
 async def all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await update.message.reply_text("מחלץ נתונים... ⚡")
-    conn = sqlite3.connect('stocks.db')
-    c = conn.cursor()
-    c.execute("SELECT name, ticker FROM stocks")
-    rows = c.fetchall()
-    conn.close()
-
-    tickers_list = [row[1] for row in rows]
-    ticker_names = {row[1]: row[0] for row in rows}
+    status_msg = await update.message.reply_text("מחלץ נתונים עדכניים... ⚡")
     
     try:
-        t = Ticker(tickers_list, verify=False, asynchronous=True)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT name, ticker FROM stocks")
+        rows = c.fetchall()
+        conn.close()
+
+        if not rows:
+            await status_msg.edit_text("הרשימה שלך ריקה. השתמש בפקודה /add כדי להוסיף מניות.")
+            return
+
+        tickers_list = [row[1] for row in rows]
+        ticker_names = {row[1]: row[0] for row in rows}
+        
+        # שליפה קבוצתית מהירה (Asynchronous)
+        t = Ticker(tickers_list, asynchronous=True)
         all_data = t.price
         
-        # עיצוב חדש כדי למנוע בלגן בעין
-        msg = "📊 **שערי מניות:**\n"
+        msg = "📊 **שערי מניות ושינוי יומי:**\n"
         msg += "━━━━━━━━━━━━━━━\n"
         
         for ticker in tickers_list:
             data = all_data.get(ticker, {})
+            if isinstance(data, str): continue # דילוג על שגיאות במניה בודדת
+            
             price = data.get('regularMarketPrice')
             change_pct = data.get('regularMarketChangePercent', 0) * 100
             name = ticker_names.get(ticker)
@@ -66,16 +79,17 @@ async def all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 trend = "+" if change_pct >= 0 else ""
                 curr = "₪" if "USDILS" in ticker else "$" if "BTC" in ticker else ""
                 
-                # שם המניה בשורה אחת, הנתונים בשורה נפרדת בתוך בלוק קוד
-                msg += f"🔹 {name}\n"
+                # עיצוב מיושר: שם המניה מודגש, נתונים בבלוק קוד למניעת היפוך RTL
+                msg += f"🔹 **{name}**\n"
                 msg += f"`{curr}{price:,.2f} ({icon} {trend}{change_pct:.2f}%)`\n\n"
         
         msg += "━━━━━━━━━━━━━━━\n"
-        msg += f"⏰ {pd.Timestamp.now().strftime('%H:%M:%S')}"
+        msg += f"⏰ עודכן: {pd.Timestamp.now().strftime('%H:%M:%S')}"
+        
         await status_msg.edit_text(msg, parse_mode='Markdown')
         
     except Exception as e:
-        await status_msg.edit_text(f"שגיאה: {e}")
+        await status_msg.edit_text(f"שגיאה בשליפת הנתונים: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -84,18 +98,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == '❓ עזרה':
         await start(update, context)
     elif text == '➕ הוספת מניה':
-        await update.message.reply_text("הקלד: `/add [סימול] [שם]`", parse_mode='Markdown')
+        await update.message.reply_text(
+            "כדי להוסיף מניה חדשה, שלח הודעה בפורמט הבא:\n"
+            "`/add [סימול] [שם המניה]`\n\n"
+            "לדוגמה: `/add NVDA אנבידיה`", 
+            parse_mode='Markdown'
+        )
+
+async def add_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("שימוש לא תקין. דוגמה: `/add TSLA טסלה`", parse_mode='Markdown')
+        return
+    ticker, name = context.args[0].upper(), " ".join(context.args[1:])
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO stocks (name, ticker) VALUES (?, ?)", (name, ticker))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(f"✅ המניה **{name}** ({ticker}) נוספה בהצלחה לרשימה.")
+
+async def remove_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("נא לציין סימול להסרה. דוגמה: `/remove TSLA`", parse_mode='Markdown')
+        return
+    ticker = context.args[0].upper()
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM stocks WHERE ticker = ?", (ticker,))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(f"❌ הסימול **{ticker}** הוסר מהרשימה.")
 
 def main():
+    # אתחול בסיס הנתונים בנתיב ה-Volume
     init_db()
+    
     TOKEN = "8597980945:AAEX_T-yhNkLmfoZfdEcqD6tUJdxHGBZMw0"
     app = Application.builder().token(TOKEN).build()
     
+    # רישום פקודות בסיסיות
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("all", all_prices))
+    app.add_handler(CommandHandler("add", add_stock))
+    app.add_handler(CommandHandler("remove", remove_stock))
+    
+    # רישום מאזין לכפתורי המקלדת (טקסט חופשי)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("🚀 הבוט רץ! שלח /start (עם סלאש רגיל) בטלגרם.")
+    print("🚀 הבוט רץ כעת על Railway עם אחסון קבוע...")
     app.run_polling()
 
 if __name__ == "__main__":

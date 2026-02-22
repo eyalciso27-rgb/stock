@@ -17,8 +17,10 @@ def init_db():
     c.execute("SELECT COUNT(*) FROM stocks")
     if c.fetchone()[0] == 0:
         default_stocks = [
-            ('נאסד"ק 100', '^NDX'), ('S&P 500', '^GSPC'),
-            ('ביטקוין', 'BTC-USD'), ('דולר/שקל', 'USDILS=X'),
+            ('נאסד"ק 100', '^NDX'), 
+            ('מדד S&P 500', 'SPY'),
+            ('ביטקוין', 'BTC-USD'), 
+            ('דולר/שקל', 'USDILS=X'),
             ('מדד תא 35', 'TA35.TA')
         ]
         c.executemany("INSERT INTO stocks (name, ticker) VALUES (?, ?)", default_stocks)
@@ -33,7 +35,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
-        f"שלום {update.effective_user.first_name}! 👋\nהבוט מוכן עם שעון ישראל מעודכן.",
+        f"שלום {update.effective_user.first_name}! 👋\nהבוט מוכן עם עיצוב משודרג ושעון ישראל.",
         reply_markup=reply_markup
     )
 
@@ -55,29 +57,41 @@ async def all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t = Ticker(tickers_list, asynchronous=True, formatted=False)
         all_data = t.price
         
-        msg = "📊 **שערי מניות ומדדים:**\n━━━━━━━━━━━━━━━\n"
+        # בניית ההודעה בעיצוב המקצועי
+        msg = "📊 **שערי מניות ומדדים:**\n"
+        msg += "━━━━━━━━━━━━━━━\n\n"
+        
         for ticker in tickers_list:
             data = all_data.get(ticker, {})
             name = ticker_names.get(ticker)
+            
             if not isinstance(data, dict):
                 msg += f"🔹 **{name}**\n`שגיאה בסימול ({ticker})`\n\n"
                 continue
+            
             price = data.get('regularMarketPrice')
             change_pct = data.get('regularMarketChangePercent', 0) * 100
+            
             if price:
                 icon = "🟢" if change_pct >= 0 else "🔴"
                 trend = "+" if change_pct >= 0 else ""
                 curr = "₪" if ".TA" in ticker or "USDILS" in ticker else "$"
                 if "^" in ticker: curr = "" 
-                msg += f"🔹 **{name}**\n`{curr}{price:,.2f} ({icon} {trend}{change_pct:.2f}%)`\n\n"
+                
+                # עיצוב בולט: שם עם יהלום, ומחיר בתוך בלוק קוד למניעת היפוך RTL
+                msg += f"🔹 **{name}**\n"
+                msg += f"`{curr}{price:,.2f} ({icon} {trend}{change_pct:.2f}%)`\n\n"
         
         # חישוב זמן ישראל
         israel_tz = pytz.timezone('Asia/Jerusalem')
         current_time = pd.Timestamp.now(tz=israel_tz).strftime('%H:%M:%S')
         
         msg += "━━━━━━━━━━━━━━━\n"
-        msg += f"⏰ זמן עדכון (ישראל): {current_time}"
+        msg += f"⏰ זמן עדכון: {current_time}"
+        
+        # חשוב מאוד: parse_mode='Markdown' כדי שהעיצוב יעבוד
         await status_msg.edit_text(msg, parse_mode='Markdown')
+        
     except Exception as e:
         await status_msg.edit_text(f"שגיאה: {e}")
 
@@ -94,7 +108,7 @@ async def show_removal_menu(update: Update):
 
     keyboard = []
     for name, ticker in rows:
-        keyboard.append([InlineKeyboardButton(f"❌ הסר את {name} ({ticker})", callback_data=f"del_{ticker}")])
+        keyboard.append([InlineKeyboardButton(f"❌ הסר את {name}", callback_data=f"del_{ticker}")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("בחר מניה להסרה מהרשימה:", reply_markup=reply_markup)
@@ -110,7 +124,7 @@ async def remove_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     conn.commit()
     conn.close()
     
-    await query.edit_message_text(text=f"✅ הסימול **{ticker_to_remove}** הוסר בהצלחה.")
+    await query.edit_message_text(text=f"✅ המניה **{ticker_to_remove}** הוסרה בהצלחה.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text

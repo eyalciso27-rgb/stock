@@ -7,7 +7,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 # נתיב למסד הנתונים בתוך ה-Volume ב-Railway
 # אם ב-Railway הגדרת Mount Path כ- /app , הקובץ יישמר שם
-DB_PATH = '/app/stocks.db'
+DB_PATH = '/app/data/stocks.db'
 
 def init_db():
     # וודא שהתיקייה קיימת לפני יצירת הקובץ
@@ -122,3 +122,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

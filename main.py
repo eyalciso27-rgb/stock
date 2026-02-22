@@ -5,13 +5,12 @@ from yahooquery import Ticker
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# הנתיב המדויק לפי ההגדרה שלך ב-Railway
-DB_PATH = '/app/data/stocks.db'
+# נתיב חיצוני מבודד - מבטיח שהקוד לא ייעלם
+DB_PATH = '/database/stocks.db'
 
 def init_db():
-    # יצירת התיקייה בתוך ה-Volume במידה ואינה קיימת
+    # יצירת התיקייה במידה והיא לא קיימת בתוך ה-Volume
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS stocks (name TEXT, ticker TEXT)''')
@@ -30,7 +29,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [['📊 הצג את כל השערים'], ['➕ הוספת מניה', '❓ עזרה']]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
-        f"שלום {update.effective_user.first_name}! 🚀\nהבוט מחובר לאחסון קבוע בענן.",
+        f"שלום {update.effective_user.first_name}! 🚀\nהבוט מחובר לאחסון חיצוני מבודד.",
         reply_markup=reply_markup
     )
 
@@ -42,23 +41,13 @@ async def all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.execute("SELECT name, ticker FROM stocks")
         rows = c.fetchall()
         conn.close()
-
-        if not rows:
-            await status_msg.edit_text("הרשימה ריקה.")
-            return
-
         tickers_list = [row[1] for row in rows]
         ticker_names = {row[1]: row[0] for row in rows}
-        
-        # משיכת נתונים טריים עם ביטול מטמון (formatted=False)
         t = Ticker(tickers_list, asynchronous=True, formatted=False)
         all_data = t.price
-        
-        msg = "📊 **שערי מניות ושינוי יומי:**\n"
-        msg += "━━━━━━━━━━━━━━━\n"
+        msg = "📊 **שערי מניות:**\n━━━━━━━━━━━━━━━\n"
         for ticker in tickers_list:
             data = all_data.get(ticker, {})
-            if isinstance(data, str): continue
             price = data.get('regularMarketPrice')
             change_pct = data.get('regularMarketChangePercent', 0) * 100
             name = ticker_names.get(ticker)
@@ -66,10 +55,7 @@ async def all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 icon = "🟢" if change_pct >= 0 else "🔴"
                 trend = "+" if change_pct >= 0 else ""
                 curr = "₪" if "USDILS" in ticker else "$" if "BTC" in ticker else ""
-                # יישור הטקסט בתוך בלוק קוד כדי למנוע היפוך
-                msg += f"🔹 **{name}**\n"
-                msg += f"`{curr}{price:,.2f} ({icon} {trend}{change_pct:.2f}%)`\n\n"
-        
+                msg += f"🔹 **{name}**\n`{curr}{price:,.2f} ({icon} {trend}{change_pct:.2f}%)`\n\n"
         msg += "━━━━━━━━━━━━━━━\n"
         msg += f"⏰ {pd.Timestamp.now().strftime('%H:%M:%S')}"
         await status_msg.edit_text(msg, parse_mode='Markdown')
@@ -82,7 +68,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.text == '❓ עזרה':
         await start(update, context)
     elif update.message.text == '➕ הוספת מניה':
-        await update.message.reply_text("להוספה שלח פקודה: `/add AAPL אפל`", parse_mode='Markdown')
+        await update.message.reply_text("להוספה: `/add [סימול] [שם]`", parse_mode='Markdown')
 
 async def add_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2: return
@@ -90,7 +76,7 @@ async def add_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("INSERT INTO stocks (name, ticker) VALUES (?, ?)", (name, ticker))
     conn.commit(); conn.close()
-    await update.message.reply_text(f"✅ נוספה המניה: **{name}**")
+    await update.message.reply_text(f"✅ נוסף: {name}")
 
 async def remove_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: return
@@ -98,7 +84,7 @@ async def remove_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("DELETE FROM stocks WHERE ticker = ?", (ticker,))
     conn.commit(); conn.close()
-    await update.message.reply_text(f"❌ הוסר הסימול: **{ticker}**")
+    await update.message.reply_text(f"❌ הוסר: {ticker}")
 
 def main():
     init_db()

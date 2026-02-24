@@ -1,12 +1,12 @@
 import os
 import sqlite3
 import pandas as pd
-import pytz  # ספרייה לניהול אזורי זמן
+import pytz
 from yahooquery import Ticker
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 
-# נתיב חיצוני מבודד ב-Railway
+# נתיב חיצוני ב-Railway
 DB_PATH = '/database/stocks.db'
 
 def init_db():
@@ -17,30 +17,48 @@ def init_db():
     c.execute("SELECT COUNT(*) FROM stocks")
     if c.fetchone()[0] == 0:
         default_stocks = [
-            ('נאסד"ק 100', '^NDX'), 
-            ('מדד S&P 500', 'SPY'),
-            ('ביטקוין', 'BTC-USD'), 
-            ('דולר/שקל', 'USDILS=X'),
+            ('נאסד"ק 100', '^NDX'), ('מדד S&P 500', 'SPY'),
+            ('ביטקוין', 'BTC-USD'), ('דולר/שקל', 'USDILS=X'),
             ('מדד תא 35', 'TA35.TA')
         ]
         c.executemany("INSERT INTO stocks (name, ticker) VALUES (?, ?)", default_stocks)
     conn.commit()
     conn.close()
 
+# פונקציה לבחירת ברכה לפי שעה בישראל
+def get_greeting():
+    israel_tz = pytz.timezone('Asia/Jerusalem')
+    hour = pd.Timestamp.now(tz=israel_tz).hour
+    if 5 <= hour < 12:
+        return "בוקר טוב"
+    elif 12 <= hour < 18:
+        return "צהריים טובים"
+    elif 18 <= hour < 22:
+        return "ערב טוב"
+    else:
+        return "לילה טוב"
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_name = update.effective_user.first_name
+    greeting = get_greeting()
+    
     keyboard = [
         ['📊 הצג את כל השערים'],
         ['➕ הוספת מניה', '❌ הסרת מניה'],
         ['❓ עזרה']
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
     await update.message.reply_text(
-        f"שלום {update.effective_user.first_name}! 👋\nהבוט מוכן עם עיצוב משודרג ושעון ישראל.",
+        f"{greeting}, {user_name}! 👋\nאני בוט המניות שלך. כאן תוכל לעקוב אחרי כל המדדים והמניות שמעניינים אותך.",
         reply_markup=reply_markup
     )
 
 async def all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await update.message.reply_text("מרענן נתונים... 🔄")
+    user_name = update.effective_user.first_name
+    greeting = get_greeting()
+    status_msg = await update.message.reply_text(f"מחלץ נתונים עבורך, {user_name}... 🔄")
+    
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -49,7 +67,7 @@ async def all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
         if not rows:
-            await status_msg.edit_text("הרשימה ריקה.")
+            await status_msg.edit_text("הרשימה ריקה. הוסף מניות בעזרת כפתור הפלוס.")
             return
 
         tickers_list = [row[1] for row in rows]
@@ -57,8 +75,9 @@ async def all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t = Ticker(tickers_list, asynchronous=True, formatted=False)
         all_data = t.price
         
-        # בניית ההודעה בעיצוב המקצועי
-        msg = "📊 **שערי מניות ומדדים:**\n"
+        # בניית ההודעה עם ברכה משתנה
+        msg = f"{greeting}, {user_name}! 📊\n"
+        msg += "**אלו שערי המניות והמדדים שלך:**\n"
         msg += "━━━━━━━━━━━━━━━\n\n"
         
         for ticker in tickers_list:
@@ -78,18 +97,17 @@ async def all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 curr = "₪" if ".TA" in ticker or "USDILS" in ticker else "$"
                 if "^" in ticker: curr = "" 
                 
-                # עיצוב בולט: שם עם יהלום, ומחיר בתוך בלוק קוד למניעת היפוך RTL
+                # עיצוב מיושר למניעת היפוך RTL
                 msg += f"🔹 **{name}**\n"
                 msg += f"`{curr}{price:,.2f} ({icon} {trend}{change_pct:.2f}%)`\n\n"
         
-        # חישוב זמן ישראל
+        # זמן ישראל
         israel_tz = pytz.timezone('Asia/Jerusalem')
         current_time = pd.Timestamp.now(tz=israel_tz).strftime('%H:%M:%S')
         
         msg += "━━━━━━━━━━━━━━━\n"
         msg += f"⏰ זמן עדכון: {current_time}"
         
-        # חשוב מאוד: parse_mode='Markdown' כדי שהעיצוב יעבוד
         await status_msg.edit_text(msg, parse_mode='Markdown')
         
     except Exception as e:

@@ -6,10 +6,10 @@ from yahooquery import Ticker
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 
-# שימוש בווליום הקיים עם קובץ חדש להפרדה בטוחה
+# נתיב הווליום הקיים
 DB_PATH = '/database/personal_stocks.db'
 
-# רשימת ברירת המחדל לכל משתמש חדש
+# רשימת ברירת המחדל לכל משתמש (ID) חדש
 DEFAULT_LIST = [
     ('נאסד"ק 100', '^NDX'), 
     ('מדד S&P 500', 'SPY'),
@@ -22,10 +22,20 @@ def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # יצירת טבלה הכוללת user_id לניהול אישי לכל משתמש
     c.execute('''CREATE TABLE IF NOT EXISTS stocks 
                  (name TEXT, ticker TEXT, user_id INTEGER)''')
     conn.commit()
+    conn.close()
+
+# פונקציה שמוודא שלמשתמש יש את מניות ברירת המחדל
+def ensure_default_stocks(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM stocks WHERE user_id = ?", (user_id,))
+    if c.fetchone()[0] == 0:
+        for name, ticker in DEFAULT_LIST:
+            c.execute("INSERT INTO stocks (name, ticker, user_id) VALUES (?, ?, ?)", (name, ticker, user_id))
+        conn.commit()
     conn.close()
 
 def get_greeting():
@@ -39,51 +49,37 @@ def get_greeting():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name
-    greeting = get_greeting()
+    ensure_default_stocks(user_id) # מוודא שיש מניות ב-ID הזה
     
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM stocks WHERE user_id = ?", (user_id,))
-    
-    # אם המשתמש חדש, הבוט מעתיק עבורו את רשימת ברירת המחדל
-    if c.fetchone()[0] == 0:
-        for name, ticker in DEFAULT_LIST:
-            c.execute("INSERT INTO stocks (name, ticker, user_id) VALUES (?, ?, ?)", (name, ticker, user_id))
-        conn.commit()
-    conn.close()
-
     keyboard = [['📊 הצג את כל השערים'], ['➕ הוספת מניה', '❌ הסרת מניה'], ['❓ עזרה']]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
     await update.message.reply_text(
-        f"{greeting}, {user_name}! 👋\nהמערכת האישית שלך הופעלה. בתור התחלה, טענתי עבורך את המניות המוכרות.",
+        f"{get_greeting()}, {user_name}! 👋\nהמערכת האישית הופעלה עם מניות ברירת המחדל.",
         reply_markup=reply_markup
     )
 
 async def all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name
-    greeting = get_greeting()
-    status_msg = await update.message.reply_text(f"מחלץ נתונים עבורך, {user_name}... 🔄")
+    ensure_default_stocks(user_id) # בדיקה נוספת למקרה שהמשתמש לא הריץ /start
+    
+    status_msg = await update.message.reply_text(f"מעדכן נתונים עבורך, {user_name}... 🔄")
     
     try:
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("SELECT name, ticker FROM stocks WHERE user_id = ?", (user_id,))
         rows = c.fetchall(); conn.close()
 
-        if not rows:
-            await status_msg.edit_text("הרשימה האישית שלך ריקה. השתמש ב-➕ הוספת מניה."); return
-
         tickers_list = [row[1] for row in rows]
         ticker_names = {row[1]: row[0] for row in rows}
         t = Ticker(tickers_list, asynchronous=True, formatted=False)
         all_data = t.price
         
-        msg = f"{greeting}, {user_name}! 📊\n**אלו השערים האישיים שלך:**\n━━━━━━━━━━━━━━━\n\n"
+        msg = f"{get_greeting()}, {user_name}! 📊\n**אלו השערים האישיים שלך:**\n━━━━━━━━━━━━━━━\n\n"
         for ticker in tickers_list:
             data = all_data.get(ticker, {})
             name = ticker_names.get(ticker)
-            if not isinstance(data, dict):
-                msg += f"🔹 **{name}**\n`שגיאה בסימול ({ticker})`\n\n"; continue
+            if not isinstance(data, dict): continue
             
             price = data.get('regularMarketPrice')
             change_pct = data.get('regularMarketChangePercent', 0) * 100
@@ -94,8 +90,7 @@ async def all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if "^" in ticker: curr = "" 
                 msg += f"🔹 **{name}**\n`{curr}{price:,.2f} ({icon} {trend}{change_pct:.2f}%)`\n\n"
         
-        israel_tz = pytz.timezone('Asia/Jerusalem')
-        current_time = pd.Timestamp.now(tz=israel_tz).strftime('%H:%M:%S')
+        current_time = pd.Timestamp.now(tz=pytz.timezone('Asia/Jerusalem')).strftime('%H:%M:%S')
         msg += "━━━━━━━━━━━━━━━\n" + f"⏰ זמן עדכון: {current_time}"
         await status_msg.edit_text(msg, parse_mode='Markdown')
     except Exception as e:
@@ -106,24 +101,18 @@ async def show_removal_menu(update: Update):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT name, ticker FROM stocks WHERE user_id = ?", (user_id,))
     rows = c.fetchall(); conn.close()
-
     if not rows:
-        await update.message.reply_text("אין מניות להסרה מהתיק שלך."); return
-
-    keyboard = [[InlineKeyboardButton(f"❌ הסר את {n}", callback_data=f"del_{t}")] for n, t in rows]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("בחר מניה להסרה מהרשימה האישית שלך:", reply_markup=reply_markup)
+        await update.message.reply_text("אין מניות להסרה."); return
+    keyboard = [[InlineKeyboardButton(f"❌ {n}", callback_data=f"del_{t}")] for n, t in rows]
+    await update.message.reply_text("בחר מניה להסרה:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def remove_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = update.effective_user.id
-    await query.answer()
-    ticker_to_remove = query.data.replace("del_", "")
-    
+    query = update.callback_query; user_id = update.effective_user.id
+    ticker = query.data.replace("del_", "")
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("DELETE FROM stocks WHERE ticker = ? AND user_id = ?", (ticker_to_remove, user_id))
+    c.execute("DELETE FROM stocks WHERE ticker = ? AND user_id = ?", (ticker, user_id))
     conn.commit(); conn.close()
-    await query.edit_message_text(text=f"✅ המניה **{ticker_to_remove}** הוסרה מהתיק האישי שלך.")
+    await query.edit_message_text(text=f"✅ המניה {ticker} הוסרה מהתיק האישי שלך.")
 
 async def add_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -132,7 +121,7 @@ async def add_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("INSERT INTO stocks (name, ticker, user_id) VALUES (?, ?, ?)", (name, ticker, user_id))
     conn.commit(); conn.close()
-    await update.message.reply_text(f"✅ המניה **{name}** נוספה לרשימה האישית שלך.")
+    await update.message.reply_text(f"✅ המניה **{name}** נוספה.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -145,11 +134,9 @@ def main():
     init_db()
     TOKEN = "8597980945:AAEX_T-yhNkLmfoZfdEcqD6tUJdxHGBZMw0"
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add_stock))
+    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("add", add_stock))
     app.add_handler(CallbackQueryHandler(remove_callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

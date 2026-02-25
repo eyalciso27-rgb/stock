@@ -22,33 +22,19 @@ def init_db():
         db_dir = os.path.dirname(DB_PATH)
         if not os.path.exists(db_dir):
             os.makedirs(db_dir, mode=0o777, exist_ok=True)
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        # יצירת טבלאות בסיסיות אם לא קיימות
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute('CREATE TABLE IF NOT EXISTS stocks (name TEXT, ticker TEXT, user_id INTEGER)')
         c.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT, is_premium INTEGER DEFAULT 0)')
-        
-        # תיקון השגיאה: הוספת העמודות החסרות לטבלת stocks במידה ואינן קיימות
-        try:
-            c.execute('ALTER TABLE stocks ADD COLUMN quantity REAL DEFAULT 0')
-        except sqlite3.OperationalError: pass # העמודה כבר קיימת
-        
-        try:
-            c.execute('ALTER TABLE stocks ADD COLUMN purchase_price REAL DEFAULT 0')
-        except sqlite3.OperationalError: pass # העמודה כבר קיימת
-
-        try:
-            c.execute('ALTER TABLE users ADD COLUMN is_premium INTEGER DEFAULT 0')
-        except sqlite3.OperationalError: pass
-        
-        conn.commit()
-        conn.close()
-        logging.info("Database initialized and migrated successfully.")
+        try: c.execute('ALTER TABLE stocks ADD COLUMN quantity REAL DEFAULT 0')
+        except: pass
+        try: c.execute('ALTER TABLE stocks ADD COLUMN purchase_price REAL DEFAULT 0')
+        except: pass
+        try: c.execute('ALTER TABLE users ADD COLUMN is_premium INTEGER DEFAULT 0')
+        except: pass
+        conn.commit(); conn.close()
+        logging.info("Database initialized successfully.")
     except Exception as e:
         logging.error(f"Database Init Error: {e}")
-        raise
 
 def register_user(user_id, first_name):
     try:
@@ -66,18 +52,32 @@ def get_user_limit(user_id):
         return PREMIUM_LIMIT if res and res[0] == 1 else DEFAULT_LIMIT
     except: return DEFAULT_LIMIT
 
-# --- לוגיקת נתונים ---
+# --- לוגיקת נתונים משופרת ---
 
 async def get_stock_analysis(ticker_symbol):
     try:
         t = Ticker(ticker_symbol)
-        news = t.news(3)
-        if not news: return "לא נמצאו חדשות עדכניות."
-        msg = f"🧐 **ניתוח עבור {ticker_symbol}:**\n\n"
-        for item in news:
-            msg += f"• [{item['title']}]({item['link']})\n"
-        return msg
-    except: return "⚠️ שגיאה בשליפת נתונים."
+        # משיכת חדשות בזהירות
+        news_data = t.news(5)
+        
+        analysis = f"🧐 **ניתוח וחדשות עבור {ticker_symbol}:**\n\n"
+        
+        if not news_data or not isinstance(news_data, list):
+            return analysis + "לא נמצאו חדשות עדכניות עבור מניה זו ב-Yahoo Finance."
+
+        count = 0
+        for item in news_data:
+            title = item.get('title')
+            link = item.get('link')
+            if title and link:
+                analysis += f"• [{title}]({link})\n\n"
+                count += 1
+            if count >= 3: break # מציג עד 3 כתבות כדי לא להעמיס
+
+        return analysis
+    except Exception as e:
+        logging.error(f"Analysis Error for {ticker_symbol}: {e}")
+        return f"⚠️ כרגע לא ניתן לשלוף חדשות עבור {ticker_symbol}. נסה שוב מאוחר יותר."
 
 async def get_prices_text(user_id, user_name):
     try:
@@ -99,12 +99,14 @@ async def get_prices_text(user_id, user_name):
             change = d.get('regularMarketChangePercent', 0) * 100
             icon = "🟢" if change >= 0 else "🔴"
             symbol = "₪" if ".TA" in ticker or "USDILS" in ticker else "$"
+            
             msg += f"🔹 **{name}** ({ticker})\nשער: `{symbol}{curr_p:,.2f}` ({icon} {change:+.2f}%)\n"
             if qty > 0 and buy_p > 0:
                 p_pct = ((curr_p / buy_p) - 1) * 100
                 msg += f"💰 רווח כולל: `{p_pct:+.2f}%`\n"
             msg += "\n"
             keyboard.append([InlineKeyboardButton(f"🔍 ניתוח: {name}", callback_data=f"analyze_{ticker}")])
+
         keyboard.append([InlineKeyboardButton("🔄 רענון נתונים", callback_data="refresh")])
         return msg, InlineKeyboardMarkup(keyboard)
     except Exception as e:
@@ -171,7 +173,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [[InlineKeyboardButton(f"❌ {n}", callback_data=f"del_{t}")] for n, t in rows]
         await update.message.reply_text("בחר להסרה:", reply_markup=InlineKeyboardMarkup(kb))
 
-    # --- פונקציות ניהול ---
     elif text == '📊 סטטיסטיקה' and user_id == ADMIN_ID:
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM users"); u_count = c.fetchone()[0]
@@ -182,7 +183,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("SELECT user_id, first_name, is_premium FROM users WHERE user_id != ?", (ADMIN_ID,))
         users = c.fetchall(); conn.close()
-        if not users: await update.message.reply_text("אין משתמשים רשומים."); return
+        if not users: await update.message.reply_text("אין משתמשים."); return
         kb = [[InlineKeyboardButton(f"{'💎' if is_p else '👤'} {name}", callback_data=f"tgp_{uid}")] for uid, name, is_p in users]
         await update.message.reply_text("שינוי סטטוס פרימיום:", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -204,7 +205,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); user_id = update.effective_user.id
     if query.data.startswith("analyze_"):
-        analysis = await get_stock_analysis(query.data.split("_")[1])
+        ticker = query.data.split("_")[1]
+        analysis = await get_stock_analysis(ticker)
         await context.bot.send_message(chat_id=user_id, text=analysis, parse_mode='Markdown', disable_web_page_preview=True)
     elif query.data == "refresh":
         msg, kb = await get_prices_text(user_id, update.effective_user.first_name)
@@ -223,7 +225,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("DELETE FROM stocks WHERE ticker = ? AND user_id = ?", (ticker, user_id))
         conn.commit(); conn.close()
-        await query.edit_message_text(f"✅ {ticker} הוסרה מהתיק.")
+        await query.edit_message_text(f"✅ {ticker} הוסרה.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -239,8 +241,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    logging.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__": main()

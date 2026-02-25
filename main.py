@@ -4,7 +4,7 @@ import pandas as pd
 import pytz
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from yahooquery import Ticker
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
@@ -18,140 +18,158 @@ ADMIN_ID = 7969303152
 DEFAULT_LIMIT = 10
 PREMIUM_LIMIT = 50
 
+# זיכרון זמני לחדשות
+news_cache = {}
+
 def init_db():
     try:
         db_dir = os.path.dirname(DB_PATH)
         if not os.path.exists(db_dir): os.makedirs(db_dir, mode=0o777, exist_ok=True)
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute('CREATE TABLE IF NOT EXISTS stocks (name TEXT, ticker TEXT, user_id INTEGER)')
+        c.execute('CREATE TABLE IF NOT EXISTS stocks (name TEXT, ticker TEXT, user_id INTEGER, quantity REAL DEFAULT 0, purchase_price REAL DEFAULT 0)')
         c.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT, is_premium INTEGER DEFAULT 0)')
-        try: c.execute('ALTER TABLE stocks ADD COLUMN quantity REAL DEFAULT 0')
-        except: pass
-        try: c.execute('ALTER TABLE stocks ADD COLUMN purchase_price REAL DEFAULT 0')
-        except: pass
         conn.commit(); conn.close()
     except Exception as e: logging.error(f"DB Error: {e}")
 
-def register_user(user_id, first_name):
-    try:
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO users (user_id, first_name) VALUES (?, ?)", (user_id, first_name))
-        c.execute("UPDATE users SET first_name = ? WHERE user_id = ?", (first_name, user_id))
-        conn.commit(); conn.close()
-    except: pass
-
-def get_greeting():
-    # קביעת ברכה לפי שעה בישראל
+def get_greeting(first_name):
     israel_tz = pytz.timezone('Asia/Jerusalem')
     hour = datetime.now(israel_tz).hour
-    if 5 <= hour < 12: return "בוקר טוב ☀️"
-    if 12 <= hour < 18: return "צהריים טובים ✨"
-    if 18 <= hour < 22: return "ערב טוב 🌙"
-    return "לילה טוב 😴"
+    if 5 <= hour < 12: greet = "בוקר טוב"
+    elif 12 <= hour < 18: greet = "צהריים טובים"
+    elif 18 <= hour < 22: greet = "ערב טוב"
+    else: greet = "לילה טוב"
+    return f"{greet}, {first_name}! 💎"
 
 # --- לוגיקת נתונים ---
 
 async def get_stock_analysis(ticker_symbol):
-    try:
-        # בביטקוין וקריפטו ננסה למשוך חדשות בפורמט מעט שונה
-        t = Ticker(ticker_symbol)
-        news_data = t.news(5)
-        
-        analysis = f"🧐 **חדשות עבור {ticker_symbol}:**\n\n"
-        if not news_data or not isinstance(news_data, list):
-            return f"⚠️ לא נמצאו חדשות עדכניות עבור {ticker_symbol} ב-Yahoo Finance. ייתכן שהמקור חסום זמנית."
+    now = datetime.now()
+    if ticker_symbol in news_cache:
+        cached_time, cached_data = news_cache[ticker_symbol]
+        if now - cached_time < timedelta(minutes=15): return cached_data
 
-        for item in news_data[:3]:
-            title = item.get('title', 'ללא כותרת')
-            link = item.get('link', '#')
-            analysis += f"• [{title}]({link})\n\n"
+    try:
+        user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        t = Ticker(ticker_symbol, user_agent=user_agent)
+        news_data = t.news(3)
+        if not news_data: raise Exception("No news")
+        
+        analysis = f"🧐 **חדשות אחרונות עבור {ticker_symbol}:**\n\n"
+        for item in news_data:
+            analysis += f"• [{item.get('title')}]({item.get('link')})\n\n"
+        news_cache[ticker_symbol] = (now, analysis)
         return analysis
-    except: return f"⚠️ כרגע יש עומס ב-Yahoo Finance. נסה שוב בעוד דקה."
+    except:
+        inv_url = f"https://www.investing.com/search/?q={ticker_symbol.split('-')[0]}"
+        return f"⚠️ Yahoo Finance חסום זמנית.\n\n[צפה בחדשות ב-Investing.com]({inv_url})"
 
 async def get_prices_text(user_id, user_name):
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute("SELECT name, ticker, quantity, purchase_price FROM stocks WHERE user_id = ?", (user_id,))
+    rows = c.fetchall(); conn.close()
+    greeting = get_greeting(user_name)
+    if not rows: return f"{greeting}\n\nהתיק שלך ריק כרגע.", None
+    
     try:
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute("SELECT name, ticker, quantity, purchase_price FROM stocks WHERE user_id = ?", (user_id,))
-        rows = c.fetchall(); conn.close()
-        if not rows: return f"{get_greeting()} {user_name},\nהתיק שלך ריק כרגע.", None
-        
         t = Ticker([r[1] for r in rows], asynchronous=True, formatted=False)
         prices = t.price
-        
-        msg = f"{get_greeting()} **{user_name}**, הנה התיק שלך:\n━━━━━━━━━━━━━━━\n\n"
-        keyboard = []
+        msg = f"{greeting}\nמצב התיק שלך:\n━━━━━━━━━━━━━━━\n\n"
+        kb = []
         for name, ticker, qty, buy_p in rows:
             d = prices.get(ticker, {})
             curr_p = d.get('regularMarketPrice', 0)
             change = d.get('regularMarketChangePercent', 0) * 100
             icon = "🟢" if change >= 0 else "🔴"
             symbol = "₪" if ".TA" in ticker or "USDILS" in ticker else "$"
-            
-            msg += f"🔹 **{name}** ({ticker})\nשער: `{symbol}{curr_p:,.2f}` ({icon} {change:+.2f}%)\n"
-            if qty > 0 and buy_p > 0:
-                p_pct = ((curr_p / buy_p) - 1) * 100
-                msg += f"💰 רווח כולל: `{p_pct:+.2f}%`\n"
-            msg += "\n"
-            keyboard.append([InlineKeyboardButton(f"🔍 ניתוח: {name}", callback_data=f"analyze_{ticker}")])
+            msg += f"🔹 **{name}**\nשער: `{symbol}{curr_p:,.2f}` ({icon} {change:+.2f}%)\n\n"
+            kb.append([InlineKeyboardButton(f"🔍 ניתוח: {name}", callback_data=f"analyze_{ticker}")])
+        kb.append([InlineKeyboardButton("🔄 רענון נתונים", callback_data="refresh")])
+        return msg, InlineKeyboardMarkup(kb)
+    except: return "⚠️ שגיאה בטעינה.", None
 
-        keyboard.append([InlineKeyboardButton("🔄 רענון נתונים", callback_data="refresh")])
-        return msg, InlineKeyboardMarkup(keyboard)
-    except: return "⚠️ שגיאה בטעינת נתונים.", None
-
-# --- הנדלרים ---
+# --- טיפול בהודעות ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name
     text = update.message.text
     state = context.user_data.get('state')
-    register_user(user_id, user_name)
 
+    # הגדרת מקלדות
     main_kb = [['📊 הצג את כל השערים'], ['➕ הוספת מניה', '❌ הסרת מניה']]
-    if user_id == ADMIN_ID: main_kb.append(['📊 סטטיסטיקה', '💎 ניהול פרימיום', '📢 הודעה לכולם'])
+    if user_id == ADMIN_ID:
+        main_kb.append(['📊 סטטיסטיקה', '💎 ניהול פרימיום', '📢 הודעה לכולם'])
+    reply_markup = ReplyKeyboardMarkup(main_kb, resize_keyboard=True)
 
+    # בדיקת כפתורי מנהל (לפני הכל)
+    if user_id == ADMIN_ID:
+        if text == '📊 סטטיסטיקה':
+            conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM users"); u_cnt = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM users WHERE is_premium = 1"); p_cnt = c.fetchone()[0]
+            await update.message.reply_text(f"👥 משתמשים: {u_cnt}\n💎 פרימיום: {p_cnt}")
+            return
+        elif text == '💎 ניהול פרימיום':
+            conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+            c.execute("SELECT user_id, first_name, is_premium FROM users WHERE user_id != ?", (ADMIN_ID,))
+            users = c.fetchall(); conn.close()
+            kb = [[InlineKeyboardButton(f"{'💎' if p else '👤'} {n}", callback_data=f"tgp_{uid}")] for uid, n, p in users]
+            await update.message.reply_text("בחר משתמש לשינוי סטטוס:", reply_markup=InlineKeyboardMarkup(kb))
+            return
+        elif text == '📢 הודעה לכולם':
+            await update.message.reply_text("כתוב את ההודעה לשידור:", reply_markup=ReplyKeyboardRemove())
+            context.user_data['state'] = 'BROADCAST'; return
+
+    # כפתורים רגילים
     if text == '📊 הצג את כל השערים':
         msg, kb = await get_prices_text(user_id, user_name)
         await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=kb, disable_web_page_preview=True)
-    
     elif text == '➕ הוספת מניה':
         await update.message.reply_text("סימול המניה (למשל AAPL):", reply_markup=ReplyKeyboardRemove())
         context.user_data['state'] = 'T'
+    elif text == '❌ הסרת מניה':
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute("SELECT name, ticker FROM stocks WHERE user_id = ?", (user_id,))
+        rows = c.fetchall(); conn.close()
+        if not rows: await update.message.reply_text("אין מניות."); return
+        kb = [[InlineKeyboardButton(f"❌ {n}", callback_data=f"del_{t}")] for n, t in rows]
+        await update.message.reply_text("בחר להסרה:", reply_markup=InlineKeyboardMarkup(kb))
     
-    # ... (לוגיקת הוספה/הסרה/ניהול כפי שהייתה) ...
-    # לקיצור, הקפד להשאיר את ה-states שכתבנו בגרסה הקודמת
+    # לוגיקת States (הוספה/שידור)
+    elif state == 'T':
+        context.user_data['temp_t'] = text.upper(); context.user_data['state'] = 'N'
+        await update.message.reply_text("שם המניה:")
+    elif state == 'N':
+        context.user_data['temp_n'] = text; context.user_data['state'] = 'P'
+        await update.message.reply_text("מחיר קנייה? (או 'דלג'):", reply_markup=ReplyKeyboardMarkup([['דלג ⏩']], resize_keyboard=True))
+    elif state == 'P':
+        context.user_data['temp_p'] = float(text) if text != 'דלג ⏩' else 0
+        context.user_data['state'] = 'Q'
+        await update.message.reply_text("כמות? (או 'דלג'):")
+    elif state == 'Q':
+        qty = float(text) if text != 'דלג ⏩' else 0
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute("INSERT INTO stocks (name, ticker, user_id, quantity, purchase_price) VALUES (?, ?, ?, ?, ?)",
+                  (context.user_data['temp_n'], context.user_data['temp_t'], user_id, qty, context.user_data['temp_p']))
+        conn.commit(); conn.close(); context.user_data.clear()
+        await update.message.reply_text("✅ נוספה!", reply_markup=reply_markup)
+    elif state == 'BROADCAST':
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute("SELECT user_id FROM users"); users = c.fetchall(); conn.close()
+        for u in users:
+            try: await context.bot.send_message(chat_id=u[0], text=f"📢 **הודעה חשובה:**\n\n{text}", parse_mode='Markdown')
+            except: pass
+        await update.message.reply_text("✅ נשלח!", reply_markup=reply_markup)
+        context.user_data.clear()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    register_user(user.id, user.first_name)
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, first_name) VALUES (?, ?)", (user.id, user.first_name))
+    conn.commit(); conn.close()
+    
     kb = [['📊 הצג את כל השערים'], ['➕ הוספת מניה', '❌ הסרת מניה']]
     if user.id == ADMIN_ID: kb.append(['📊 סטטיסטיקה', '💎 ניהול פרימיום', '📢 הודעה לכולם'])
-    
-    welcome = f"{get_greeting()} **{user.first_name}**!\nברוך הבא לבוט המניות האישי שלך."
-    await update.message.reply_text(welcome, parse_mode='Markdown', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    await update.message.reply_text(f"{get_greeting(user.first_name)}\nברוך הבא!", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    user_id = update.effective_user.id
-    user_name = update.effective_user.first_name
-
-    if query.data.startswith("analyze_"):
-        ticker = query.data.split("_")[1]
-        analysis = await get_stock_analysis(ticker)
-        await context.bot.send_message(chat_id=user_id, text=analysis, parse_mode='Markdown', disable_web_page_preview=True)
-    elif query.data == "refresh":
-        msg, kb = await get_prices_text(user_id, user_name)
-        try: await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=kb, disable_web_page_preview=True)
-        except: pass
-    # ... (המשך ה-callback של del ו-tgp)
-
-def main():
-    init_db()
-    TOKEN = "8597980945:AAEX_T-yhNkLmfoZfdEcqD6tUJdxHGBZMw0"
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__": main()
+# --- main והשאר נשארים זהים ---

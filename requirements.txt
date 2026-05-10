@@ -2,3 +2,5 @@ python-telegram-bot
 yahooquery
 pandas
 pytz
+feedparser
+flask
